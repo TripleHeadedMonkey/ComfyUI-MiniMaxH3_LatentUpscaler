@@ -156,6 +156,99 @@ def _decode_h3(vae, video: torch.Tensor, output_device: torch.device, upscale: i
     return pixel_samples.to(output_device).movedim(1, -1)
 
 
+def _h3_frame_count(video_t: int) -> int:
+    """Convert stock H3 video-latent T into decoded frame count."""
+    video_t = int(video_t)
+    if video_t < 2 or (video_t - 2) % 5:
+        raise ValueError(
+            f"Temporal tiling requires an H3 latent on the 17k+5 grid; got latent T={video_t}."
+        )
+    return 5 + 17 * ((video_t - 2) // 5)
+
+
+def _temporal_settings(tile_frames: int, context_frames: int) -> tuple[int, int, int, int]:
+    """Resolve UI frame requests to H3's causal groups.
+
+    The first two latent positions decode five frames. Each subsequent group of
+    five latent positions adds seventeen frames. Later tiles include two extra
+    leading latent positions plus context groups, then discard their decoded
+    prefix so only stable centre frames are retained.
+    """
+    tile_groups = max(1, int(round(max(17, int(tile_frames)) / 17.0)))
+    context_groups = max(0, int(round(max(5, int(context_frames)) - 5) / 17.0))
+    return tile_groups, context_groups, 17 * tile_groups, 5 + 17 * context_groups
+
+
+def _decode_h3_temporal_tiled(
+    vae,
+    video: torch.Tensor,
+    output_device: torch.device,
+    upscale: int,
+    tile_frames: int,
+    context_frames: int,
+    seam_warning_threshold: float,
+) -> torch.Tensor:
+    """Decode H3 in causal temporal windows and retain only stable regions."""
+    total_frames = _h3_frame_count(video.shape[2])
+    total_groups = (int(video.shape[2]) - 2) // 5
+    tile_groups, context_groups, resolved_tile, resolved_context = _temporal_settings(
+        tile_frames, context_frames
+    )
+    if total_groups <= tile_groups:
+        return _decode_h3(vae, video, output_device, upscale)
+
+    print(
+        f"[MiniMax H3 VAE Decode] Temporal tiling: {total_frames}f total, "
+        f"{resolved_tile}f new per tile, {resolved_context}f causal context."
+    )
+    pieces = []
+    completed_groups = 0
+    worst_seam = 0.0
+
+    while completed_groups < total_groups:
+        core_groups = min(tile_groups, total_groups - completed_groups)
+        if completed_groups == 0:
+            end_t = 2 + 5 * core_groups
+            decoded = _decode_h3(vae, video[:, :, :end_t], output_device, upscale)
+            pieces.append(decoded)
+        else:
+            overlap_groups = min(context_groups, completed_groups)
+            # Include the two causal base positions immediately before the
+            # overlap groups. This makes each sliced window itself 2+5k long.
+            start_t = 5 * (completed_groups - overlap_groups)
+            end_t = 2 + 5 * (completed_groups + core_groups)
+            decoded = _decode_h3(vae, video[:, :, start_t:end_t], output_device, upscale)
+            discard = 5 + 17 * overlap_groups
+            if int(decoded.shape[1]) <= discard:
+                raise RuntimeError("Temporal tile produced no stable frames after context removal.")
+
+            threshold = float(seam_warning_threshold)
+            if threshold > 0 and pieces:
+                compare = min(discard, int(pieces[-1].shape[1]))
+                if compare:
+                    previous = pieces[-1][:, -compare:].float()
+                    repeated = decoded[:, discard - compare:discard].float()
+                    difference = float(torch.mean(torch.abs(previous - repeated)).item())
+                    worst_seam = max(worst_seam, difference)
+                    if difference > threshold:
+                        print(
+                            f"[MiniMax H3 VAE Decode] WARNING: temporal seam near frame "
+                            f"{5 + 17 * completed_groups} measured {difference:.6f}, above "
+                            f"threshold {threshold:.6f}. Increase temporal_context_frames."
+                        )
+            pieces.append(decoded[:, discard:])
+        completed_groups += core_groups
+
+    images = torch.cat(pieces, dim=1)
+    if int(images.shape[1]) != total_frames:
+        raise RuntimeError(
+            f"Temporal reconstruction produced {images.shape[1]} frames; expected {total_frames}."
+        )
+    if float(seam_warning_threshold) > 0:
+        print(f"[MiniMax H3 VAE Decode] Worst temporal overlap difference: {worst_seam:.6f}.")
+    return images
+
+
 class MiniMaxH3VAEDecodeFast:
     """Decode H3 video latents with larger spatial tiles and optional GPU output."""
 
@@ -213,6 +306,46 @@ class MiniMaxH3VAEDecodeFast:
                         ),
                     },
                 ),
+                "temporal_tiling": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "Off preserves the original full temporal decode. On decodes causal "
+                            "overlapping sections and removes their repeated context to reduce peak VRAM."
+                        ),
+                    },
+                ),
+                "temporal_tile_frames": (
+                    "INT",
+                    {
+                        "default": 85,
+                        "min": 17,
+                        "max": 3599,
+                        "step": 17,
+                        "tooltip": "Approximate number of new decoded frames per temporal tile; snapped to 17-frame H3 groups.",
+                    },
+                ),
+                "temporal_context_frames": (
+                    "INT",
+                    {
+                        "default": 39,
+                        "min": 5,
+                        "max": 702,
+                        "step": 17,
+                        "tooltip": "Leading causal context decoded again and discarded at every temporal boundary.",
+                    },
+                ),
+                "seam_warning_threshold": (
+                    "FLOAT",
+                    {
+                        "default": 0.02,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.001,
+                        "tooltip": "Warn when repeated overlap differs by more than this mean absolute value; 0 disables checking.",
+                    },
+                ),
             }
         }
 
@@ -224,10 +357,22 @@ class MiniMaxH3VAEDecodeFast:
         "H3 video VAE decode with spatial-tile and output-device controls. "
         "Default 256px / 64 overlap matches stock VAEDecode quality. Larger tile_size "
         "keeps the same overlap ratio. Decodes through H3's own tiled path only — no "
-        "generic 3D-tiler fallback. Temporal 17-frame chunking is unchanged."
+        "generic 3D-tiler fallback. Optional causal temporal tiling supports long latents."
     )
 
-    def decode(self, samples, vae, tiling=True, tile_size=256, tile_overlap=64, output_device="cpu"):
+    def decode(
+        self,
+        samples,
+        vae,
+        tiling=True,
+        tile_size=256,
+        tile_overlap=64,
+        output_device="cpu",
+        temporal_tiling=False,
+        temporal_tile_frames=85,
+        temporal_context_frames=39,
+        seam_warning_threshold=0.02,
+    ):
         inner = _h3_video_vae(vae)
         video = _video_latent(samples)
         packed_channels, upscale = _decoder_channel_packing(inner)
@@ -251,7 +396,18 @@ class MiniMaxH3VAEDecodeFast:
             inner.tiling = bool(tiling)
             inner.tile_size = tile_size
             inner.tile_overlap_min = overlap
-            images = _decode_h3(vae, video, out_dev, upscale)
+            if temporal_tiling:
+                images = _decode_h3_temporal_tiled(
+                    vae,
+                    video,
+                    out_dev,
+                    upscale,
+                    temporal_tile_frames,
+                    temporal_context_frames,
+                    seam_warning_threshold,
+                )
+            else:
+                images = _decode_h3(vae, video, out_dev, upscale)
         finally:
             inner.decoder.out_channels = saved_out_channels
             inner.pixel_mean = saved_pixel_mean
